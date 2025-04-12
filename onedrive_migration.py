@@ -10,9 +10,24 @@ import logging
 from dotenv import load_dotenv
 import webbrowser
 import humanize
+import msal
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Load configuration
+CONFIG_FILE = 'config.json'
+try:
+    with open(CONFIG_FILE, 'r') as f:
+        CONFIG = json.load(f)
+except FileNotFoundError:
+    CONFIG = {
+        "excluded_paths": [],
+        "batch_size": 10,
+        "retry_attempts": 3,
+        "verify_after_transfer": True
+    }
+    logging.info(f"No {CONFIG_FILE} found, using default configuration")
 
 # Configuration
 CLIENT_ID = os.getenv('ONEDRIVE_CLIENT_ID')  # Get Client ID from environment variable
@@ -41,6 +56,9 @@ class OneDriveMigration:
         self.temp_dir = "temp_downloads"
         os.makedirs(self.temp_dir, exist_ok=True)
         self.app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+        # Initialize tokens
+        self.source_token = None
+        self.dest_token = None
         # Add statistics tracking
         self.stats = {
             'total_files': 0,
@@ -64,28 +82,42 @@ class OneDriveMigration:
         with open(self.progress_file, 'w') as f:
             json.dump(self.migrated_files, f)
 
-    def get_access_token(self, account_type="source"):
-        """Get access token using device code flow"""
-        flow = self.app.initiate_device_flow(scopes=SCOPES)
-        
-        if "user_code" not in flow:
-            raise ValueError(f"Failed to create device flow: {flow.get('error_description')}")
+    def authenticate_accounts(self):
+        """Authenticate both source and destination accounts."""
+        logging.info(f"Please authenticate your source account ({self.source_username})...")
+        self.source_token = self.get_fresh_token("source")
+        logging.info(f"\nPlease authenticate your destination account ({self.dest_username})...")
+        self.dest_token = self.get_fresh_token("destination")
+        return self.source_token and self.dest_token
 
-        # Display message and open browser
-        print(f"\nTo sign in to your {account_type} account, use a web browser to open the page {flow['verification_uri']} and enter the code {flow['user_code']} to authenticate.")
-        
-        # Try to open the verification URL in the default browser
+    def authenticate_account(self, account_type):
         try:
-            webbrowser.open(flow['verification_uri'])
-        except:
-            pass  # If browser opening fails, user can still use the URL manually
+            # Try to get token from cache first
+            accounts = self.app.get_accounts()
+            if accounts:
+                logging.info(f"Found cached account for {account_type}")
+                result = self.app.acquire_token_silent(SCOPES, account=accounts[0])
+                if result:
+                    return result
 
-        result = self.app.acquire_token_by_device_flow(flow)
-        
-        if "access_token" not in result:
-            raise Exception(f"Failed to get access token: {result.get('error_description')}")
+            # If no cached token, use device code flow
+            logging.info(f"Please authenticate your {account_type} account...")
+            flow = self.app.initiate_device_flow(scopes=SCOPES)
+            if "user_code" not in flow:
+                raise ValueError("Failed to create device flow. Please ensure the app is registered correctly in Azure Portal.")
+
+            print(f"\nTo sign in, use a web browser to open {flow['verification_uri']}")
+            print(f"and enter the code {flow['user_code']} to authenticate.")
             
-        return result["access_token"]
+            result = self.app.acquire_token_by_device_flow(flow)
+            if "access_token" in result:
+                return result
+            else:
+                raise ValueError(f"Authentication failed: {result.get('error_description', 'Unknown error')}")
+            
+        except Exception as e:
+            logging.error(f"An error occurred during authentication: {str(e)}")
+            raise
 
     def get_file_hash(self, access_token, item_id):
         """Get file hash from OneDrive"""
@@ -97,23 +129,77 @@ class OneDriveMigration:
         file_info = response.json()
         return file_info.get('file', {}).get('hashes', {}).get('sha1Hash', '')
 
-    def get_drive_items(self, access_token, path=""):
-        """Get items from OneDrive with pagination support"""
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        items = []
-        url = f"https://graph.microsoft.com/v1.0/me/drive/root:{path}:/children"
-        
-        while url:
-            response = requests.get(url, headers=headers)
-            data = response.json()
-            items.extend(data.get('value', []))
-            url = data.get('@odata.nextLink', None)
+    def should_exclude_path(self, path):
+        """Check if the path should be excluded based on configuration."""
+        normalized_path = path.strip('/')
+        for excluded_path in CONFIG.get('excluded_paths', []):
+            if normalized_path.startswith(excluded_path) or normalized_path == excluded_path:
+                logging.info(f"Skipping excluded path: {path}")
+                return True
+        return False
+
+    def get_fresh_token(self, account_type="source"):
+        """Get a fresh access token, handling refresh if needed."""
+        accounts = self.app.get_accounts()
+        if account_type == "source":
+            account = next((acc for acc in accounts if acc['username'] == self.source_username), None)
+        else:
+            account = next((acc for acc in accounts if acc['username'] == self.dest_username), None)
+
+        if account:
+            result = self.app.acquire_token_silent(SCOPES, account=account)
+            if not result:
+                logging.info(f"Token expired, acquiring new token for {account_type} account...")
+                flow = self.app.initiate_device_flow(scopes=SCOPES)
+                if "user_code" not in flow:
+                    raise ValueError("Failed to create device flow. Please ensure the app is registered correctly in Azure Portal.")
+                
+                print(f"\nTo sign in, use a web browser to open {flow['verification_uri']}")
+                print(f"and enter the code {flow['user_code']} to authenticate.")
+                
+                result = self.app.acquire_token_by_device_flow(flow)
+            return result['access_token']
+        else:
+            logging.info(f"Please authenticate your {account_type} account...")
+            flow = self.app.initiate_device_flow(scopes=SCOPES)
+            if "user_code" not in flow:
+                raise ValueError("Failed to create device flow. Please ensure the app is registered correctly in Azure Portal.")
             
-        return items
+            print(f"\nTo sign in, use a web browser to open {flow['verification_uri']}")
+            print(f"and enter the code {flow['user_code']} to authenticate.")
+            
+            result = self.app.acquire_token_by_device_flow(flow)
+            return result['access_token']
+
+    def get_drive_items(self, access_token, path=""):
+        """Get items from OneDrive."""
+        headers = {'Authorization': f'Bearer {access_token}'}
+        if path:
+            encoded_path = requests.utils.quote(f'/{path}')
+            url = f'https://graph.microsoft.com/v1.0/me/drive/root:{encoded_path}:/children'
+        else:
+            url = 'https://graph.microsoft.com/v1.0/me/drive/root/children'
+        
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 401:  # Token expired
+                logging.info("Token expired, refreshing...")
+                new_token = self.get_fresh_token("source" if access_token == self.source_token else "destination")
+                if access_token == self.source_token:
+                    self.source_token = new_token
+                else:
+                    self.dest_token = new_token
+                headers = {'Authorization': f'Bearer {new_token}'}
+                response = requests.get(url, headers=headers)
+            
+            response.raise_for_status()
+            items = response.json().get('value', [])
+            
+            # Filter out excluded paths
+            return [item for item in items if not self.should_exclude_path(f"{path}/{item['name']}" if path else item['name'])]
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error getting drive items: {e}")
+            return []
 
     def create_folder(self, access_token, path):
         """Create folder structure in destination"""
@@ -244,58 +330,32 @@ class OneDriveMigration:
         return total_size, files_count, folders_count
 
     def migrate_folder(self, source_token, dest_token, source_path="", relative_path=""):
-        """Migrate folder contents with resume capability and progress tracking"""
-        # Initialize stats if this is the root call
-        if not source_path and not relative_path:
-            logging.info("Calculating total size and file count...")
-            total_size, total_files, total_folders = self.get_total_size(source_token)
-            self.stats.update({
-                'total_files': total_files,
-                'total_folders': total_folders,
-                'total_size': total_size,
-                'start_time': time.time()
-            })
-            logging.info(f"Found {total_files} files in {total_folders} folders, total size: {humanize.naturalsize(total_size)}")
+        """Migrate a folder and its contents."""
+        if self.should_exclude_path(relative_path):
+            logging.info(f"Skipping excluded folder: {relative_path}")
+            return
 
         items = self.get_drive_items(source_token, source_path)
         
         for item in items:
-            item_path = f"{source_path}/{item['name']}" if source_path else item['name']
-            relative_item_path = f"{relative_path}/{item['name']}" if relative_path else item['name']
-            dest_item_path = f"{self.dest_folder}/{relative_item_path}" if self.dest_folder else relative_item_path
+            item_name = item['name']
+            item_path = f"{relative_path}/{item_name}" if relative_path else item_name
+            
+            if self.should_exclude_path(item_path):
+                continue
 
-            if item.get("folder"):
-                logging.info(f"Processing folder: {item_path}")
-                self.create_folder(dest_token, dest_item_path)
-                self.migrate_folder(source_token, dest_token, item_path, relative_item_path)
-            else:
-                if item_path in self.migrated_files['migrated_files']:
-                    logging.info(f"Skipping already migrated file: {item_path}")
-                    self.stats['migrated_files'] += 1
-                    self.stats['migrated_size'] += item.get('size', 0)
-                    continue
-
-                self.stats['current_file'] = item_path
-                self._update_progress()
-
-                local_path = os.path.join(self.temp_dir, relative_item_path)
-                if self.download_file(source_token, item, local_path):
-                    upload_result = self.upload_file(dest_token, local_path, dest_item_path)
-                    
-                    if upload_result and self.verify_file_migration(source_token, dest_token, item, dest_item_path):
-                        self.migrated_files['migrated_files'].append(item_path)
-                        self._save_progress()
-                        self.stats['migrated_files'] += 1
-                        self.stats['migrated_size'] += item.get('size', 0)
-                    else:
-                        self.migrated_files['failed_files'].append(item_path)
-                        self._save_progress()
-                        logging.error(f"Failed to verify migration of {item_path}")
+            if item.get('folder'):  # It's a folder
+                self.stats['total_folders'] += 1
+                new_source_path = f"{source_path}/{item_name}" if source_path else item_name
+                new_relative_path = f"{relative_path}/{item_name}" if relative_path else item_name
                 
-                if os.path.exists(local_path):
-                    os.remove(local_path)
-
-                self._update_progress()
+                # Create the folder in destination
+                self.create_folder(dest_token, new_relative_path)
+                
+                # Recursively migrate the folder contents
+                self.migrate_folder(source_token, dest_token, new_source_path, new_relative_path)
+            else:  # It's a file
+                self._migrate_file(source_token, dest_token, item, item_path)
 
     def verify_complete_migration(self, source_token, dest_token):
         """Verify the entire migration"""
@@ -360,6 +420,53 @@ class OneDriveMigration:
         logging.info(f"Verification report saved to: {report_file}")
         return verification_results['verified_files'] == verification_results['total_files']
 
+    def _migrate_file(self, source_token, dest_token, item, item_path):
+        """Migrate a single file with progress tracking and verification."""
+        self.stats['total_files'] += 1
+        self.stats['total_size'] += item.get('size', 0)
+        
+        if item_path in self.migrated_files.get('migrated_files', []):
+            logging.info(f"Skipping already migrated file: {item_path}")
+            self.stats['migrated_files'] += 1
+            return
+
+        self.stats['current_file'] = item_path
+        self._update_progress()
+
+        local_path = os.path.join(self.temp_dir, item_path)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        try:
+            # Download file
+            if self.download_file(source_token, item, local_path):
+                # Upload file
+                dest_path = f"{self.dest_folder}/{item_path}" if self.dest_folder else item_path
+                if self.upload_file(dest_token, local_path, dest_path):
+                    # Verify migration
+                    if self.verify_file_migration(source_token, dest_token, item, dest_path):
+                        self.migrated_files.setdefault('migrated_files', []).append(item_path)
+                        self._save_progress()
+                        self.stats['migrated_files'] += 1
+                        logging.info(f"Successfully migrated: {item_path}")
+                    else:
+                        self.migrated_files.setdefault('failed_files', []).append(item_path)
+                        self._save_progress()
+                        logging.error(f"Failed to verify migration of {item_path}")
+                else:
+                    self.migrated_files.setdefault('failed_files', []).append(item_path)
+                    self._save_progress()
+                    logging.error(f"Failed to upload {item_path}")
+            else:
+                self.migrated_files.setdefault('failed_files', []).append(item_path)
+                self._save_progress()
+                logging.error(f"Failed to download {item_path}")
+        finally:
+            # Clean up local file
+            if os.path.exists(local_path):
+                os.remove(local_path)
+
+        self._update_progress()
+
 def main():
     # Get destination folder
     dest_folder = input("Enter destination folder name (press Enter for root folder): ").strip()
@@ -371,30 +478,26 @@ def main():
         dest_folder=dest_folder
     )
     
+    # Authenticate accounts
+    if not migration.authenticate_accounts():
+        logging.error("Failed to authenticate one or both accounts")
+        return
+
     try:
-        # Get access tokens using device code flow
-        logging.info("Please authenticate your source account (juergenrichert@gmx.de)...")
-        source_token = migration.get_access_token("source")
-        
-        logging.info("\nPlease authenticate your destination account (juergen@team-richert)...")
-        dest_token = migration.get_access_token("destination")
-        
         # Create destination folder if specified
         if dest_folder:
             logging.info(f"Creating destination folder: {dest_folder}")
-            migration.create_folder(dest_token, dest_folder)
-        
+            migration.create_folder(migration.dest_token, dest_folder)
+
         # Start migration
         logging.info("Starting migration...")
-        migration.migrate_folder(source_token, dest_token)
-        
+        migration.migrate_folder(migration.source_token, migration.dest_token)
+
         # Verify migration
         logging.info("Verifying migration...")
-        if migration.verify_complete_migration(source_token, dest_token):
-            logging.info("Migration completed and verified successfully!")
-        else:
-            logging.warning("Migration completed but verification found discrepancies. Check the verification report for details.")
-            
+        migration.verify_complete_migration(migration.source_token, migration.dest_token)
+        
+        logging.info("Migration completed and verified successfully!")
     except Exception as e:
         logging.error(f"An error occurred during migration: {str(e)}")
     finally:

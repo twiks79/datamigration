@@ -1,76 +1,80 @@
 # OneDrive Migration Tool
 
-This tool helps you migrate your OneDrive data from one Microsoft account to another.
-
-## Prerequisites
-
-1. Python 3.6 or higher
-2. A registered application in Azure AD with the following permissions:
-   - Files.ReadWrite.All
-   - User.Read
-
-## Setup
-
-1. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. Register an application in Azure AD:
-   - Go to https://portal.azure.com
-   - Navigate to "Azure Active Directory" > "App registrations"
-   - Click "New registration"
-   - Enter a name for your application
-   - Select "Accounts in any organizational directory (Any Azure AD directory - Multitenant)"
-   - Click "Register"
-   - Note down the "Application (client) ID"
-   - Under "API permissions", add the following permissions:
-     - Microsoft Graph > Delegated permissions > Files.ReadWrite.All
-     - Microsoft Graph > Delegated permissions > User.Read
-   - Click "Grant admin consent"
-
-3. Set up environment variables:
-   ```bash
-   export ONEDRIVE_CLIENT_ID="your_client_id_here"
-   ```
-
-## Usage
-
-1. Run the script:
-   ```bash
-   python onedrive_migration.py
-   ```
-
-2. When prompted:
-   - Enter the password for your source account
-   - Enter the password for your destination account
-   - Enter the destination folder name (optional, press Enter for root folder)
-
-The script will:
-- Download files from your source OneDrive account
-- Upload them to your destination OneDrive account
-- Maintain the same folder structure
-- Clean up temporary files after completion
-- Generate a verification report
+A Python-based tool for migrating files between OneDrive accounts with verification and progress tracking.
 
 ## Features
+- Migrate files between OneDrive accounts
+- Exclude specific folders from migration
+- Progress tracking and resume capability
+- File verification after transfer
+- Detailed logging and error reporting
+- Configurable settings via config.json
 
-- **Resume Capability**: If the migration is interrupted, it can be resumed from where it left off
-- **Progress Tracking**: Saves progress in `migration_progress.json`
-- **Verification**: Verifies each file after migration and generates a detailed report
-- **Error Handling**: Retries failed operations with exponential backoff
-- **Logging**: Detailed logs are saved to `migration.log`
+## Prerequisites
+- Python 3.9 or higher
+- Microsoft Azure app registration with proper permissions
+- Access to both source and destination OneDrive accounts
 
-## Files Generated
+## Installation
+1. Clone this repository
+2. Install dependencies:
+   ```bash
+   pip3 install -r requirements.txt
+   ```
+3. Create a `.env` file with your Azure app credentials:
+   ```
+   ONEDRIVE_CLIENT_ID=your_client_id
+   ```
 
-- `migration.log`: Contains detailed logs of the migration process
-- `migration_progress.json`: Tracks progress and failed files
-- `migration_verification_TIMESTAMP.txt`: Contains verification report
+## Configuration
+Create a `config.json` file with the following structure:
+```json
+{
+    "excluded_paths": [
+        "Z_Dropbox"
+    ],
+    "batch_size": 10,
+    "retry_attempts": 3,
+    "verify_after_transfer": true
+}
+```
 
-## Notes
+## Usage
+1. Run the migration script:
+   ```bash
+   python3 onedrive_migration.py
+   ```
+2. Enter the destination folder name when prompted
+3. Follow the authentication steps in your browser
+4. Monitor progress in the console and migration.log
 
-- The script uses a temporary directory to store files during migration
-- Progress is shown with a progress bar
-- Make sure you have enough free space on your computer for the temporary files
-- Passwords are not stored and are only used for authentication
-- The Client ID should be kept secure and not shared 
+## Files
+- `onedrive_migration.py`: Main migration script
+- `config.json`: Migration settings
+- `.env`: Authentication credentials
+- `migration.log`: Operation logs
+- `migration_progress.json`: Progress tracking
+- `migration_verification_*.txt`: Verification reports
+
+## Error Handling
+The script includes:
+- Automatic token refresh
+- Retry mechanisms for failed operations
+- Detailed error logging
+- Progress saving for resuming interrupted migrations
+
+## Development Status
+- Basic functionality implemented
+- Authentication working
+- Configuration system in place
+- Progress tracking operational
+
+## Next Steps
+1. Implement parallel processing
+2. Add support for large files
+3. Enhance error recovery
+4. Add more configuration options
+5. Improve progress reporting
+
+## License
+This project is licensed under the MIT License - see the LICENSE file for details. 

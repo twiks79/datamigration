@@ -1,0 +1,8 @@
+{
+    "excluded_paths": [
+        "Z_Dropbox"
+    ],
+    "batch_size": 10,
+    "retry_attempts": 3,
+    "verify_after_transfer": true
+}
