@@ -1,0 +1,60 @@
+{
+    "project": {
+        "name": "OneDrive Migration",
+        "description": "Tool for migrating files between OneDrive accounts",
+        "type": "python",
+        "mainFile": "onedrive_migration.py"
+    },
+    "python": {
+        "interpreter": "python3",
+        "requirementsFile": "requirements.txt",
+        "virtualEnv": ".venv"
+    },
+    "files": {
+        "exclude": [
+            "temp_downloads",
+            "migration.log",
+            "migration_progress.json",
+            "migration_verification_*.txt"
+        ],
+        "include": [
+            "*.py",
+            "*.json",
+            "*.md",
+            ".env.example"
+        ]
+    },
+    "tasks": {
+        "run": {
+            "command": "python3 onedrive_migration.py",
+            "description": "Run the migration script"
+        },
+        "install": {
+            "command": "pip3 install -r requirements.txt",
+            "description": "Install project dependencies"
+        }
+    },
+    "linting": {
+        "python": {
+            "enabled": true,
+            "pylint": true,
+            "flake8": true
+        }
+    },
+    "formatting": {
+        "python": {
+            "enabled": true,
+            "formatter": "black",
+            "lineLength": 100
+        }
+    },
+    "debug": {
+        "python": {
+            "enabled": true,
+            "breakpoints": {
+                "main": "onedrive_migration.py:main",
+                "migration": "onedrive_migration.py:migrate_folder"
+            }
+        }
+    }
+}
