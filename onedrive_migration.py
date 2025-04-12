@@ -7,11 +7,17 @@ from tqdm import tqdm
 import time
 from datetime import datetime
 import logging
+from dotenv import load_dotenv
+import webbrowser
+import humanize
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
 CLIENT_ID = os.getenv('ONEDRIVE_CLIENT_ID')  # Get Client ID from environment variable
 if not CLIENT_ID:
-    raise ValueError("Please set the ONEDRIVE_CLIENT_ID environment variable")
+    raise ValueError("Please set the ONEDRIVE_CLIENT_ID environment variable in .env file")
 SCOPES = ["Files.ReadWrite.All", "User.Read"]
 AUTHORITY = "https://login.microsoftonline.com/common"
 
@@ -34,6 +40,17 @@ class OneDriveMigration:
         self.migrated_files = self._load_progress()
         self.temp_dir = "temp_downloads"
         os.makedirs(self.temp_dir, exist_ok=True)
+        self.app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+        # Add statistics tracking
+        self.stats = {
+            'total_files': 0,
+            'total_folders': 0,
+            'total_size': 0,
+            'migrated_files': 0,
+            'migrated_size': 0,
+            'current_file': '',
+            'start_time': None
+        }
 
     def _load_progress(self):
         """Load progress from previous migration attempts"""
@@ -47,12 +64,28 @@ class OneDriveMigration:
         with open(self.progress_file, 'w') as f:
             json.dump(self.migrated_files, f)
 
-    def get_access_token(self, client_id, username, password):
-        app = PublicClientApplication(client_id, authority=AUTHORITY)
-        result = app.acquire_token_by_username_password(username, password, scopes=SCOPES)
-        if not result.get("access_token"):
-            raise Exception(f"Failed to get access token for {username}: {result.get('error_description')}")
-        return result.get("access_token")
+    def get_access_token(self, account_type="source"):
+        """Get access token using device code flow"""
+        flow = self.app.initiate_device_flow(scopes=SCOPES)
+        
+        if "user_code" not in flow:
+            raise ValueError(f"Failed to create device flow: {flow.get('error_description')}")
+
+        # Display message and open browser
+        print(f"\nTo sign in to your {account_type} account, use a web browser to open the page {flow['verification_uri']} and enter the code {flow['user_code']} to authenticate.")
+        
+        # Try to open the verification URL in the default browser
+        try:
+            webbrowser.open(flow['verification_uri'])
+        except:
+            pass  # If browser opening fails, user can still use the URL manually
+
+        result = self.app.acquire_token_by_device_flow(flow)
+        
+        if "access_token" not in result:
+            raise Exception(f"Failed to get access token: {result.get('error_description')}")
+            
+        return result["access_token"]
 
     def get_file_hash(self, access_token, item_id):
         """Get file hash from OneDrive"""
@@ -171,27 +204,80 @@ class OneDriveMigration:
             return source_hash == dest_hash
         return False
 
+    def _format_progress(self):
+        """Format current progress for display"""
+        elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] else 0
+        avg_speed = self.stats['migrated_size'] / elapsed if elapsed > 0 else 0
+        
+        return (
+            f"\nMigration Progress:\n"
+            f"Files: {self.stats['migrated_files']}/{self.stats['total_files']}\n"
+            f"Folders: {self.stats['total_folders']}\n"
+            f"Data: {humanize.naturalsize(self.stats['migrated_size'])}/{humanize.naturalsize(self.stats['total_size'])}\n"
+            f"Speed: {humanize.naturalsize(avg_speed)}/s\n"
+            f"Elapsed: {humanize.naturaltime(elapsed, future=False)}\n"
+            f"Current: {self.stats['current_file']}"
+        )
+
+    def _update_progress(self):
+        """Update progress display"""
+        print(self._format_progress(), end='\r')
+
+    def get_total_size(self, access_token, path=""):
+        """Calculate total size and count of files to migrate"""
+        items = self.get_drive_items(access_token, path)
+        total_size = 0
+        files_count = 0
+        folders_count = 0
+        
+        for item in items:
+            if item.get("folder"):
+                folders_count += 1
+                sub_size, sub_files, sub_folders = self.get_total_size(access_token, f"{path}/{item['name']}" if path else item['name'])
+                total_size += sub_size
+                files_count += sub_files
+                folders_count += sub_folders
+            else:
+                files_count += 1
+                total_size += item.get('size', 0)
+                
+        return total_size, files_count, folders_count
+
     def migrate_folder(self, source_token, dest_token, source_path="", relative_path=""):
-        """Migrate folder contents with resume capability"""
+        """Migrate folder contents with resume capability and progress tracking"""
+        # Initialize stats if this is the root call
+        if not source_path and not relative_path:
+            logging.info("Calculating total size and file count...")
+            total_size, total_files, total_folders = self.get_total_size(source_token)
+            self.stats.update({
+                'total_files': total_files,
+                'total_folders': total_folders,
+                'total_size': total_size,
+                'start_time': time.time()
+            })
+            logging.info(f"Found {total_files} files in {total_folders} folders, total size: {humanize.naturalsize(total_size)}")
+
         items = self.get_drive_items(source_token, source_path)
         
-        for item in tqdm(items, desc=f"Processing {source_path or 'root'}"):
+        for item in items:
             item_path = f"{source_path}/{item['name']}" if source_path else item['name']
             relative_item_path = f"{relative_path}/{item['name']}" if relative_path else item['name']
             dest_item_path = f"{self.dest_folder}/{relative_item_path}" if self.dest_folder else relative_item_path
 
             if item.get("folder"):
-                # Create folder in destination
+                logging.info(f"Processing folder: {item_path}")
                 self.create_folder(dest_token, dest_item_path)
-                # Recursively process folder contents
                 self.migrate_folder(source_token, dest_token, item_path, relative_item_path)
             else:
-                # Skip if file was already successfully migrated
                 if item_path in self.migrated_files['migrated_files']:
                     logging.info(f"Skipping already migrated file: {item_path}")
+                    self.stats['migrated_files'] += 1
+                    self.stats['migrated_size'] += item.get('size', 0)
                     continue
 
-                # Download and upload file
+                self.stats['current_file'] = item_path
+                self._update_progress()
+
                 local_path = os.path.join(self.temp_dir, relative_item_path)
                 if self.download_file(source_token, item, local_path):
                     upload_result = self.upload_file(dest_token, local_path, dest_item_path)
@@ -199,14 +285,17 @@ class OneDriveMigration:
                     if upload_result and self.verify_file_migration(source_token, dest_token, item, dest_item_path):
                         self.migrated_files['migrated_files'].append(item_path)
                         self._save_progress()
+                        self.stats['migrated_files'] += 1
+                        self.stats['migrated_size'] += item.get('size', 0)
                     else:
                         self.migrated_files['failed_files'].append(item_path)
                         self._save_progress()
                         logging.error(f"Failed to verify migration of {item_path}")
                 
-                # Clean up temporary file
                 if os.path.exists(local_path):
                     os.remove(local_path)
+
+                self._update_progress()
 
     def verify_complete_migration(self, source_token, dest_token):
         """Verify the entire migration"""
@@ -272,24 +361,23 @@ class OneDriveMigration:
         return verification_results['verified_files'] == verification_results['total_files']
 
 def main():
-    # Get credentials from user
-    source_username = "juergenrichert@gmx.de"
-    source_password = input("Enter password for juergenrichert@gmx.de: ")
-    dest_username = "juergen@team-richert"
-    dest_password = input("Enter password for juergen@team-richert: ")
-    
     # Get destination folder
     dest_folder = input("Enter destination folder name (press Enter for root folder): ").strip()
     
     # Initialize migration
-    migration = OneDriveMigration(source_username, dest_username, dest_folder)
+    migration = OneDriveMigration(
+        source_username="juergenrichert@gmx.de",
+        dest_username="juergen@team-richert",
+        dest_folder=dest_folder
+    )
     
     try:
-        # Get access tokens
-        logging.info("Authenticating with source account...")
-        source_token = migration.get_access_token(CLIENT_ID, source_username, source_password)
-        logging.info("Authenticating with destination account...")
-        dest_token = migration.get_access_token(CLIENT_ID, dest_username, dest_password)
+        # Get access tokens using device code flow
+        logging.info("Please authenticate your source account (juergenrichert@gmx.de)...")
+        source_token = migration.get_access_token("source")
+        
+        logging.info("\nPlease authenticate your destination account (juergen@team-richert)...")
+        dest_token = migration.get_access_token("destination")
         
         # Create destination folder if specified
         if dest_folder:
